@@ -4,23 +4,28 @@ use std::mem;
 use std::net::{self, SocketAddr, Shutdown};
 use std::time::Duration;
 
+use net::sys;
+
 use bytes::{Buf, BufMut};
 use futures::stream::Stream;
-use futures::sync::oneshot;
 use futures::{Future, Poll, Async};
-use iovec::IoVec;
-use mio;
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use reactor::{Handle, PollEvented};
+use reactor::Handle;
+
+#[cfg(not(target_os = "fuchsia"))]
+use iovec::IoVec;
+#[cfg(not(target_os = "fuchsia"))]
+use is_wouldblock;
+#[cfg(target_os = "fuchsia")]
+use net2::TcpStreamExt;
 
 /// An I/O object representing a TCP socket listening for incoming connections.
 ///
 /// This object can be converted into a stream of incoming connections for
 /// various forms of processing.
 pub struct TcpListener {
-    io: PollEvented<mio::net::TcpListener>,
-    pending_accept: Option<oneshot::Receiver<io::Result<(TcpStream, SocketAddr)>>>,
+    io: sys::TcpListener,
 }
 
 /// Stream returned by the `TcpListener::incoming` function representing the
@@ -36,8 +41,7 @@ impl TcpListener {
     /// The TCP listener will bind to the provided `addr` address, if available.
     /// If the result is `Ok`, the socket has successfully bound.
     pub fn bind(addr: &SocketAddr, handle: &Handle) -> io::Result<TcpListener> {
-        let l = try!(mio::net::TcpListener::bind(addr));
-        TcpListener::new(l, handle)
+        Ok(TcpListener { io: sys::TcpListener::bind(addr, handle)? })
     }
 
     /// Attempt to accept a connection and create a new connected `TcpStream` if
@@ -59,53 +63,7 @@ impl TcpListener {
     /// future's task. It's recommended to only call this from the
     /// implementation of a `Future::poll`, if necessary.
     pub fn accept(&mut self) -> io::Result<(TcpStream, SocketAddr)> {
-        loop {
-            if let Some(mut pending) = self.pending_accept.take() {
-                match pending.poll().expect("shouldn't be canceled") {
-                    Async::NotReady => {
-                        self.pending_accept = Some(pending);
-                        return Err(io::ErrorKind::WouldBlock.into())
-                    },
-                    Async::Ready(r) => return r,
-                }
-            }
-
-            if let Async::NotReady = self.io.poll_read() {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "not ready"))
-            }
-
-            match self.io.get_ref().accept() {
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::WouldBlock {
-                        self.io.need_read();
-                    }
-                    return Err(e)
-                },
-                Ok((sock, addr)) => {
-                    // Fast path if we haven't left the event loop
-                    if let Some(handle) = self.io.remote().handle() {
-                        let io = try!(PollEvented::new(sock, &handle));
-                        return Ok((TcpStream { io: io }, addr))
-                    }
-
-                    // If we're off the event loop then send the socket back
-                    // over there to get registered and then we'll get it back
-                    // eventually.
-                    let (tx, rx) = oneshot::channel();
-                    let remote = self.io.remote().clone();
-                    remote.spawn(move |handle| {
-                        let res = PollEvented::new(sock, handle)
-                            .map(move |io| {
-                                (TcpStream { io: io }, addr)
-                            });
-                        drop(tx.send(res));
-                        Ok(())
-                    });
-                    self.pending_accept = Some(rx);
-                    // continue to polling the `rx` at the beginning of the loop
-                }
-            }
-        }
+        self.io.accept().map(|(io, addr)| (TcpStream { io: io }, addr))
     }
 
     /// Create a new TCP listener from the standard library's TCP listener.
@@ -138,14 +96,7 @@ impl TcpListener {
     pub fn from_listener(listener: net::TcpListener,
                          addr: &SocketAddr,
                          handle: &Handle) -> io::Result<TcpListener> {
-        let l = try!(mio::net::TcpListener::from_listener(listener, addr));
-        TcpListener::new(l, handle)
-    }
-
-    fn new(listener: mio::net::TcpListener, handle: &Handle)
-           -> io::Result<TcpListener> {
-        let io = try!(PollEvented::new(listener, handle));
-        Ok(TcpListener { io: io, pending_accept: None })
+        Ok(TcpListener { io: sys::TcpListener::from_listener(listener, addr, handle)? })
     }
 
     /// Test whether this socket is ready to be read or not.
@@ -196,6 +147,7 @@ impl TcpListener {
     /// If this is set to `false` then the socket can be used to send and
     /// receive packets from an IPv4-mapped IPv6 address.
     pub fn set_only_v6(&self, only_v6: bool) -> io::Result<()> {
+        #[allow(deprecated)]
         self.io.get_ref().set_only_v6(only_v6)
     }
 
@@ -205,6 +157,7 @@ impl TcpListener {
     ///
     /// [link]: #method.set_only_v6
     pub fn only_v6(&self) -> io::Result<bool> {
+        #[allow(deprecated)]
         self.io.get_ref().only_v6()
     }
 }
@@ -231,7 +184,7 @@ impl Stream for Incoming {
 /// raw underlying I/O object as well as streams for the read/write
 /// notifications on the stream itself.
 pub struct TcpStream {
-    io: PollEvented<mio::net::TcpStream>,
+    io: sys::TcpStream,
 }
 
 /// Future returned by `TcpStream::connect` which will resolve to a `TcpStream`
@@ -257,18 +210,11 @@ impl TcpStream {
     /// connection or during the socket creation, that error will be returned to
     /// the future instead.
     pub fn connect(addr: &SocketAddr, handle: &Handle) -> TcpStreamNew {
-        let inner = match mio::net::TcpStream::connect(addr) {
-            Ok(tcp) => TcpStream::new(tcp, handle),
-            Err(e) => TcpStreamNewState::Error(e),
-        };
-        TcpStreamNew { inner: inner }
-    }
-
-    fn new(connected_stream: mio::net::TcpStream, handle: &Handle)
-           -> TcpStreamNewState {
-        match PollEvented::new(connected_stream, handle) {
-            Ok(io) => TcpStreamNewState::Waiting(TcpStream { io: io }),
-            Err(e) => TcpStreamNewState::Error(e),
+        TcpStreamNew { inner:
+            match sys::TcpStream::connect(addr, handle) {
+                Ok(tcp) => TcpStreamNewState::Waiting(TcpStream { io: tcp }),
+                Err(e) => TcpStreamNewState::Error(e),
+            }
         }
     }
 
@@ -279,9 +225,8 @@ impl TcpStream {
     /// returned is associated with the event loop and ready to perform I/O.
     pub fn from_stream(stream: net::TcpStream, handle: &Handle)
                        -> io::Result<TcpStream> {
-        let inner = try!(mio::net::TcpStream::from_stream(stream));
         Ok(TcpStream {
-            io: try!(PollEvented::new(inner, handle)),
+            io: try!(sys::TcpStream::from_stream(stream, handle)),
         })
     }
 
@@ -307,11 +252,10 @@ impl TcpStream {
                           addr: &SocketAddr,
                           handle: &Handle)
                           -> Box<Future<Item=TcpStream, Error=io::Error> + Send> {
-        let state = match mio::net::TcpStream::connect_stream(stream, addr) {
-            Ok(tcp) => TcpStream::new(tcp, handle),
+        Box::new(match sys::TcpStream::connect_stream(stream, addr, handle) {
+            Ok(tcp) => TcpStreamNewState::Waiting(TcpStream { io: tcp }),
             Err(e) => TcpStreamNewState::Error(e),
-        };
-        Box::new(state)
+        })
     }
 
     /// Test whether this socket is ready to be read or not.
@@ -533,6 +477,7 @@ impl AsyncWrite for TcpStream {
 }
 
 #[allow(deprecated)]
+#[cfg(not(target_os = "fuchsia"))]
 impl ::io::Io for TcpStream {
     fn poll_read(&mut self) -> Async<()> {
         <TcpStream>::poll_read(self)
@@ -565,26 +510,19 @@ impl ::io::Io for TcpStream {
     }
 }
 
-fn is_wouldblock<T>(r: &io::Result<T>) -> bool {
-    match *r {
-        Ok(_) => false,
-        Err(ref e) => e.kind() == io::ErrorKind::WouldBlock,
-    }
-}
-
 impl<'a> Read for &'a TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&self.io).read(buf)
+        Read::read(&mut &*self.io, buf)
     }
 }
 
 impl<'a> Write for &'a TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&self.io).write(buf)
+        Write::write(&mut &*self.io, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        (&self.io).flush()
+        Write::flush(&mut &*self.io)
     }
 }
 
@@ -594,50 +532,7 @@ impl<'a> AsyncRead for &'a TcpStream {
     }
 
     fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        if let Async::NotReady = <TcpStream>::poll_read(self) {
-            return Ok(Async::NotReady)
-        }
-        let r = unsafe {
-            // The `IoVec` type can't have a 0-length size, so we create a bunch
-            // of dummy versions on the stack with 1 length which we'll quickly
-            // overwrite.
-            let b1: &mut [u8] = &mut [0];
-            let b2: &mut [u8] = &mut [0];
-            let b3: &mut [u8] = &mut [0];
-            let b4: &mut [u8] = &mut [0];
-            let b5: &mut [u8] = &mut [0];
-            let b6: &mut [u8] = &mut [0];
-            let b7: &mut [u8] = &mut [0];
-            let b8: &mut [u8] = &mut [0];
-            let b9: &mut [u8] = &mut [0];
-            let b10: &mut [u8] = &mut [0];
-            let b11: &mut [u8] = &mut [0];
-            let b12: &mut [u8] = &mut [0];
-            let b13: &mut [u8] = &mut [0];
-            let b14: &mut [u8] = &mut [0];
-            let b15: &mut [u8] = &mut [0];
-            let b16: &mut [u8] = &mut [0];
-            let mut bufs: [&mut IoVec; 16] = [
-                b1.into(), b2.into(), b3.into(), b4.into(),
-                b5.into(), b6.into(), b7.into(), b8.into(),
-                b9.into(), b10.into(), b11.into(), b12.into(),
-                b13.into(), b14.into(), b15.into(), b16.into(),
-            ];
-            let n = buf.bytes_vec_mut(&mut bufs);
-            self.io.get_ref().read_bufs(&mut bufs[..n])
-        };
-
-        match r {
-            Ok(n) => {
-                unsafe { buf.advance_mut(n); }
-                Ok(Async::Ready(n))
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.need_read();
-                Ok(Async::NotReady)
-            }
-            Err(e) => Err(e),
-        }
+        self.io.read_buf(buf)
     }
 }
 
@@ -647,35 +542,7 @@ impl<'a> AsyncWrite for &'a TcpStream {
     }
 
     fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        if let Async::NotReady = <TcpStream>::poll_write(self) {
-            return Ok(Async::NotReady)
-        }
-        let r = {
-            // The `IoVec` type can't have a zero-length size, so create a dummy
-            // version from a 1-length slice which we'll overwrite with the
-            // `bytes_vec` method.
-            static DUMMY: &[u8] = &[0];
-            let iovec = <&IoVec>::from(DUMMY);
-            let mut bufs = [
-                iovec, iovec, iovec, iovec,
-                iovec, iovec, iovec, iovec,
-                iovec, iovec, iovec, iovec,
-                iovec, iovec, iovec, iovec,
-            ];
-            let n = buf.bytes_vec(&mut bufs);
-            self.io.get_ref().write_bufs(&bufs[..n])
-        };
-        match r {
-            Ok(n) => {
-                buf.advance(n);
-                Ok(Async::Ready(n))
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                self.io.need_write();
-                Ok(Async::NotReady)
-            }
-            Err(e) => Err(e),
-        }
+        self.io.write_buf(buf)
     }
 }
 
@@ -744,7 +611,7 @@ impl Future for TcpStreamNewState {
 }
 
 #[cfg(all(unix, not(target_os = "fuchsia")))]
-mod sys {
+mod anon_sys {
     use std::os::unix::prelude::*;
     use super::{TcpStream, TcpListener};
 
@@ -762,7 +629,7 @@ mod sys {
 }
 
 #[cfg(windows)]
-mod sys {
+mod anon_sys {
     // TODO: let's land these upstream with mio and then we can add them here.
     //
     // use std::os::windows::prelude::*;

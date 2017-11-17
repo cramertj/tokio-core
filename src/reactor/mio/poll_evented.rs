@@ -15,8 +15,10 @@ use mio::event::Evented;
 use mio::Ready;
 use tokio_io::{AsyncRead, AsyncWrite};
 
-use reactor::{Handle, Remote};
-use reactor::io_token::IoToken;
+use reactor;
+use reactor::mio::Handle;
+use reactor::mio::io_token::IoToken;
+use is_wouldblock;
 
 /// A concrete implementation of a stream of readiness notifications for I/O
 /// objects that originates from an event loop.
@@ -65,7 +67,7 @@ use reactor::io_token::IoToken;
 /// otherwise probably avoid using two tasks on the same `PollEvented`.
 pub struct PollEvented<E> {
     token: IoToken,
-    handle: Remote,
+    handle: reactor::Remote,
     readiness: AtomicUsize,
     io: E,
 }
@@ -84,9 +86,9 @@ impl<E: Evented> PollEvented<E> {
     ///
     /// This method returns a future which will resolve to the readiness stream
     /// when it's ready.
-    pub fn new(io: E, handle: &Handle) -> io::Result<PollEvented<E>> {
+    pub fn new(io: E, handle: &reactor::Handle) -> io::Result<PollEvented<E>> {
         Ok(PollEvented {
-            token: try!(IoToken::new(&io, handle)),
+            token: try!(IoToken::new(&io, handle.as_sys())),
             handle: handle.remote().clone(),
             readiness: AtomicUsize::new(0),
             io: io,
@@ -223,7 +225,7 @@ impl<E> PollEvented<E> {
     pub fn need_read(&self) {
         let bits = super::ready2usize(super::read_ready());
         self.readiness.fetch_and(!bits, Ordering::SeqCst);
-        self.token.schedule_read(&self.handle)
+        self.token.schedule_read(self.handle.as_sys())
     }
 
     /// Indicates to this source of events that the corresponding I/O object is
@@ -249,12 +251,12 @@ impl<E> PollEvented<E> {
     pub fn need_write(&self) {
         let bits = super::ready2usize(Ready::writable());
         self.readiness.fetch_and(!bits, Ordering::SeqCst);
-        self.token.schedule_write(&self.handle)
+        self.token.schedule_write(self.handle.as_sys())
     }
 
     /// Returns a reference to the event loop handle that this readiness stream
     /// is associated with.
-    pub fn remote(&self) -> &Remote {
+    pub fn remote(&self) -> &reactor::Remote {
         &self.handle
     }
 
@@ -395,15 +397,8 @@ impl<'a, E> ::io::Io for &'a PollEvented<E>
     }
 }
 
-fn is_wouldblock<T>(r: &io::Result<T>) -> bool {
-    match *r {
-        Ok(_) => false,
-        Err(ref e) => e.kind() == io::ErrorKind::WouldBlock,
-    }
-}
-
 impl<E> Drop for PollEvented<E> {
     fn drop(&mut self) {
-        self.token.drop_source(&self.handle);
+        self.token.drop_source(self.handle.as_sys());
     }
 }

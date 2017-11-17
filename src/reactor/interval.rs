@@ -6,11 +6,10 @@
 use std::io;
 use std::time::{Duration, Instant};
 
-use futures::{Poll, Async};
+use futures::Poll;
 use futures::stream::{Stream};
 
-use reactor::{Remote, Handle};
-use reactor::timeout_token::TimeoutToken;
+use reactor::{sys, Handle};
 
 /// A stream representing notifications at fixed interval
 ///
@@ -23,10 +22,7 @@ use reactor::timeout_token::TimeoutToken;
 /// otherwise indicated to fire at.
 #[must_use = "streams do nothing unless polled"]
 pub struct Interval {
-    token: TimeoutToken,
-    next: Instant,
-    interval: Duration,
-    handle: Remote,
+    sys: sys::Interval,
 }
 
 impl Interval {
@@ -50,10 +46,7 @@ impl Interval {
         -> io::Result<Interval>
     {
         Ok(Interval {
-            token: try!(TimeoutToken::new(at, &handle)),
-            next: at,
-            interval: dur,
-            handle: handle.remote().clone(),
+            sys: sys::Interval::new_at(at, dur, handle)?,
         })
     }
 
@@ -70,14 +63,7 @@ impl Interval {
     /// task if one isn't already blocked or update a previous one if already
     /// blocked.
     fn poll_at(&mut self, now: Instant) -> Poll<Option<()>, io::Error> {
-        if self.next <= now {
-            self.next = next_interval(self.next, now, self.interval);
-            self.token.reset_timeout(self.next, &self.handle);
-            Ok(Async::Ready(Some(())))
-        } else {
-            self.token.update_timeout(&self.handle);
-            Ok(Async::NotReady)
-        }
+        self.sys.poll_at(now)
     }
 }
 
@@ -88,12 +74,6 @@ impl Stream for Interval {
     fn poll(&mut self) -> Poll<Option<()>, io::Error> {
         // TODO: is this fast enough?
         self.poll_at(Instant::now())
-    }
-}
-
-impl Drop for Interval {
-    fn drop(&mut self) {
-        self.token.cancel_timeout(&self.handle);
     }
 }
 
@@ -111,7 +91,7 @@ fn duration_to_nanos(dur: Duration) -> Option<u64> {
         .and_then(|v| v.checked_add(dur.subsec_nanos() as u64))
 }
 
-fn next_interval(prev: Instant, now: Instant, interval: Duration) -> Instant {
+pub(crate) fn next_interval(prev: Instant, now: Instant, interval: Duration) -> Instant {
     let new = prev + interval;
     if new > now {
         return new;

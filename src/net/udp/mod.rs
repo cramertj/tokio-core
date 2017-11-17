@@ -3,13 +3,16 @@ use std::net::{self, SocketAddr, Ipv4Addr, Ipv6Addr};
 use std::fmt;
 
 use futures::{Async, Future, Poll};
-use mio;
+use net::sys;
 
-use reactor::{Handle, PollEvented};
+use reactor::Handle;
+
+#[cfg(target_os = "fuchsia")]
+use net2::UdpSocketExt;
 
 /// An I/O object representing a UDP socket.
 pub struct UdpSocket {
-    io: PollEvented<mio::net::UdpSocket>,
+    io: sys::UdpSocket,
 }
 
 mod frame;
@@ -21,13 +24,7 @@ impl UdpSocket {
     /// This function will create a new UDP socket and attempt to bind it to the
     /// `addr` provided. If the result is `Ok`, the socket has successfully bound.
     pub fn bind(addr: &SocketAddr, handle: &Handle) -> io::Result<UdpSocket> {
-        let udp = try!(mio::net::UdpSocket::bind(addr));
-        UdpSocket::new(udp, handle)
-    }
-
-    fn new(socket: mio::net::UdpSocket, handle: &Handle) -> io::Result<UdpSocket> {
-        let io = try!(PollEvented::new(socket, handle));
-        Ok(UdpSocket { io: io })
+        Ok(UdpSocket { io: sys::UdpSocket::bind(addr, handle)? })
     }
 
     /// Creates a new `UdpSocket` from the previously bound socket provided.
@@ -41,8 +38,7 @@ impl UdpSocket {
     /// `reuse_address` or binding to multiple addresses.
     pub fn from_socket(socket: net::UdpSocket,
                        handle: &Handle) -> io::Result<UdpSocket> {
-        let udp = try!(mio::net::UdpSocket::from_socket(socket));
-        UdpSocket::new(udp, handle)
+        Ok(UdpSocket { io: sys::UdpSocket::from_socket(socket, handle)? })
     }
 
     /// Provides a `Stream` and `Sink` interface for reading and writing to this
@@ -180,7 +176,7 @@ impl UdpSocket {
         if let Async::NotReady = self.io.poll_read() {
             return Err(io::ErrorKind::WouldBlock.into())
         }
-        match self.io.get_ref().recv_from(buf) {
+        match self.io.recv_from(buf) {
             Ok(n) => Ok(n),
             Err(e) => {
                 if e.kind() == io::ErrorKind::WouldBlock {
@@ -437,7 +433,7 @@ impl<T> Future for RecvDgram<T>
 }
 
 #[cfg(all(unix, not(target_os = "fuchsia")))]
-mod sys {
+mod anon_sys {
     use std::os::unix::prelude::*;
     use super::UdpSocket;
 
@@ -449,7 +445,7 @@ mod sys {
 }
 
 #[cfg(windows)]
-mod sys {
+mod anon_sys {
     // TODO: let's land these upstream with mio and then we can add them here.
     //
     // use std::os::windows::prelude::*;

@@ -98,9 +98,18 @@ extern crate bytes;
 #[macro_use]
 extern crate futures;
 extern crate iovec;
-extern crate mio;
 extern crate slab;
 extern crate tokio_io;
+
+#[cfg(not(target_os = "fuchsia"))]
+extern crate mio;
+
+#[cfg(target_os = "fuchsia")]
+extern crate fuchsia_zircon as zx;
+#[cfg(target_os = "fuchsia")]
+extern crate libc;
+#[cfg(target_os = "fuchsia")]
+extern crate net2;
 
 #[macro_use]
 extern crate scoped_tls;
@@ -112,8 +121,17 @@ extern crate log;
 #[doc(hidden)]
 pub mod io;
 
+#[cfg(not(target_os = "fuchsia"))]
 mod heap;
 #[doc(hidden)]
 pub mod channel;
 pub mod net;
+
 pub mod reactor;
+
+fn is_wouldblock<T>(r: &::std::io::Result<T>) -> bool {
+    match *r {
+        Ok(_) => false,
+        Err(ref e) => e.kind() == ::std::io::ErrorKind::WouldBlock,
+    }
+}

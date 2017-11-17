@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, not(target_os = "fuchsia")))]
 
 extern crate env_logger;
 extern crate futures;

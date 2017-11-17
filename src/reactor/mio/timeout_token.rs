@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use futures::task;
 
-use reactor::{Message, Handle, Remote};
+use reactor::mio::{Message, Handle, Remote};
 
 /// A token that identifies an active timeout.
 #[derive(Debug)]

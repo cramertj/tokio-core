@@ -3,13 +3,12 @@
 //! This module contains the `Timeout` type which is a future that will resolve
 //! at a particular point in the future.
 
-use std::io;
+use std::{fmt, io};
 use std::time::{Duration, Instant};
 
-use futures::{Future, Poll, Async};
+use futures::{Future, Poll};
 
-use reactor::{Remote, Handle};
-use reactor::timeout_token::TimeoutToken;
+use reactor::{sys, Handle};
 
 /// A future representing the notification that a timeout has occurred.
 ///
@@ -19,11 +18,14 @@ use reactor::timeout_token::TimeoutToken;
 /// they will likely fire some granularity after the exact instant that they're
 /// otherwise indicated to fire at.
 #[must_use = "futures do nothing unless polled"]
-#[derive(Debug)]
 pub struct Timeout {
-    token: TimeoutToken,
-    when: Instant,
-    handle: Remote,
+    sys: sys::Timeout,
+}
+
+impl fmt::Debug for Timeout {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        self.sys.fmt(f)
+    }
 }
 
 impl Timeout {
@@ -43,9 +45,7 @@ impl Timeout {
     /// set to fire at the specified point in the future.
     pub fn new_at(at: Instant, handle: &Handle) -> io::Result<Timeout> {
         Ok(Timeout {
-            token: try!(TimeoutToken::new(at, &handle)),
-            when: at,
-            handle: handle.remote().clone(),
+            sys: sys::Timeout::new_at(at, handle)?
         })
     }
 
@@ -63,29 +63,7 @@ impl Timeout {
     /// will be dropped. It is required to call `poll` again after this method
     /// has been called to ensure that a task is blocked on this future.
     pub fn reset(&mut self, at: Instant) {
-        self.when = at;
-        self.token.reset_timeout(self.when, &self.handle);
-    }
-
-    /// Polls this `Timeout` instance to see if it's elapsed, assuming the
-    /// current time is specified by `now`.
-    ///
-    /// The `Future::poll` implementation for `Timeout` will call `Instant::now`
-    /// each time it's invoked, but in some contexts this can be a costly
-    /// operation. This method is provided to amortize the cost by avoiding
-    /// usage of `Instant::now`, assuming that it's been called elsewhere.
-    ///
-    /// This function takes the assumed current time as the first parameter and
-    /// otherwise functions as this future's `poll` function. This will block a
-    /// task if one isn't already blocked or update a previous one if already
-    /// blocked.
-    fn poll_at(&mut self, now: Instant) -> Poll<(), io::Error> {
-        if self.when <= now {
-            Ok(Async::Ready(()))
-        } else {
-            self.token.update_timeout(&self.handle);
-            Ok(Async::NotReady)
-        }
+        self.sys.reset(at)
     }
 }
 
@@ -95,12 +73,6 @@ impl Future for Timeout {
 
     fn poll(&mut self) -> Poll<(), io::Error> {
         // TODO: is this fast enough?
-        self.poll_at(Instant::now())
-    }
-}
-
-impl Drop for Timeout {
-    fn drop(&mut self) {
-        self.token.cancel_timeout(&self.handle);
+        self.sys.poll_at(Instant::now())
     }
 }

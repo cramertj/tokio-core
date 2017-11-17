@@ -5,7 +5,7 @@ use std::io;
 use futures::task;
 use mio::event::Evented;
 
-use reactor::{Message, Remote, Handle, Direction};
+use reactor::mio::{Message, Remote, Handle, Direction};
 
 /// A token that identifies an active timeout.
 pub struct IoToken {
